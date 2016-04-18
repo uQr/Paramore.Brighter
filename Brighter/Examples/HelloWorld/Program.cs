@@ -24,6 +24,7 @@ THE SOFTWARE. */
 
 using System;
 using paramore.brighter.commandprocessor;
+using paramore.brighter.commandprocessor.Logging;
 
 namespace HelloWorld
 {
