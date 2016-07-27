@@ -42,12 +42,14 @@ using RabbitMQ.Client;
 
 namespace paramore.brighter.commandprocessor.messaginggateway.rmq
 {
+    using System;
+
     /// <summary>
     /// Class MessageGatewayConnectionPool.
     /// </summary>
     public class MessageGatewayConnectionPool
     {
-        private static readonly Dictionary<string, IConnection> s_connectionPool = new Dictionary<string, IConnection>();
+        private static readonly Dictionary<string, MessageGatewayConnectionPoolConnection> s_connectionPool = new Dictionary<string, MessageGatewayConnectionPoolConnection>();
         private static readonly object s_lock = new object();
         private static readonly ILog s_logger = LogProvider.GetCurrentClassLogger();
 
@@ -59,53 +61,135 @@ namespace paramore.brighter.commandprocessor.messaginggateway.rmq
         /// <returns></returns>
         public IConnection GetConnection(ConnectionFactory connectionFactory)
         {
-            var connectionId = GetConnectionId(connectionFactory);
-
-            IConnection connection;
-            var connectionFound = s_connectionPool.TryGetValue(connectionId, out connection);
-
-            if (connectionFound != false && connection.IsOpen != false) 
-                return connection;
-
             lock (s_lock)
             {
-                connectionFound = s_connectionPool.TryGetValue(connectionId, out connection);
+                var connectionId = GetConnectionId(connectionFactory);
 
-                if (connectionFound == false || connection.IsOpen == false)
+                s_logger.DebugFormat("RMQMessagingGateway: Acquiring leased connection to Rabbit MQ endpoint {0}", connectionFactory.Endpoint);
+
+                MessageGatewayConnectionPoolConnection leasedConnection;
+
+                var leasedConnectionFound = s_connectionPool.TryGetValue(connectionId, out leasedConnection);
+
+                if (leasedConnectionFound && leasedConnection != null && leasedConnection.IsOpen())
                 {
-                    connection = CreateConnection(connectionFactory);
+                    s_logger.DebugFormat("RMQMessagingGateway: Renewing leased connection to Rabbit MQ endpoint {0}", connectionFactory.Endpoint);
+
+                    leasedConnection.RenewLease();
+
+                    return leasedConnection.RmqConnection;
+                }
+
+                s_logger.DebugFormat("RMQMessagingGateway: Creating leased connection to Rabbit MQ endpoint {0}", connectionFactory.Endpoint);
+
+                var newLeasedConnection = new MessageGatewayConnectionPoolConnection(connectionId, connectionFactory);
+
+                if (leasedConnectionFound && (leasedConnection == null || !leasedConnection.IsOpen()))
+                {
+                    s_connectionPool[connectionId] = newLeasedConnection;
+                }
+                else
+                {
+                    s_connectionPool.Add(connectionId, newLeasedConnection);
+                }
+
+                return newLeasedConnection.RmqConnection;
+            }
+        }
+
+        public static void ShutdownAllConnections()
+        {
+            s_logger.Info("Shutting down connection pool and all connections to Rabbit MQ endpoints");
+
+            foreach (var connectionKey in s_connectionPool.Keys)
+            {
+                if (s_connectionPool[connectionKey] != null && s_connectionPool[connectionKey].IsOpen())
+                {
+                    s_connectionPool[connectionKey].Close();
                 }
             }
-
-            return connection;
         }
 
-        private IConnection CreateConnection(ConnectionFactory connectionFactory)
+        private static void TryRemoveConnection(string connectionId, string uniqueIdentifier, IConnectionFactory connectionFactory)
         {
-            var connectionId = GetConnectionId(connectionFactory);
+            lock (s_lock)
+            {
+                if (s_connectionPool.ContainsKey(connectionId))
+                {
+                    MessageGatewayConnectionPoolConnection connectionData;
 
-            TryRemoveConnection(connectionId);
+                    var connectionFound = s_connectionPool.TryGetValue(connectionId, out connectionData);
 
-            s_logger.DebugFormat("RMQMessagingGateway: Creating connection to Rabbit MQ endpoint {0}", connectionFactory.Endpoint);
+                    if (connectionFound && connectionData.LeaseIdentifier == uniqueIdentifier)
+                    {
+                        s_connectionPool[connectionId] = null;
+                    }
+                    else if (connectionFound)
+                    {
+                        s_logger.ErrorFormat("RMQMessagingGateway: Unable to remove connection as unique identifier is different indicating connection renewed.");
+                        s_logger.WarnFormat("RMQMessagingGateway: Recovering connection.");
 
-            var connection = connectionFactory.CreateConnection();
-
-            connection.ConnectionShutdown += delegate { TryRemoveConnection(connectionId); };
-
-            s_connectionPool.Add(connectionId, connection);
-            
-            return connection;
-        }
-
-        private void TryRemoveConnection(string connectionId)
-        {
-            if(s_connectionPool.ContainsKey(connectionId))
-                s_connectionPool.Remove(connectionId);
+                        connectionData.RecoverConnection(connectionFactory);
+                    }
+                }
+            }
         }
 
         private string GetConnectionId(ConnectionFactory connectionFactory)
         {
             return string.Concat(connectionFactory.UserName, ".", connectionFactory.Password, ".", connectionFactory.HostName, ".", connectionFactory.Port, ".", connectionFactory.VirtualHost).ToLowerInvariant();
+        }
+
+        private class MessageGatewayConnectionPoolConnection : IDisposable
+        {
+            private string Id { get; }
+
+            public IConnection RmqConnection { get; private set; }
+
+            public string LeaseIdentifier { get; private set; }
+
+            public MessageGatewayConnectionPoolConnection(string id, IConnectionFactory rmqConnectionFactory)
+            {
+                this.Id = id;
+                this.LeaseIdentifier = Guid.NewGuid().ToString();
+                this.RmqConnection = CreateRmqConnection(this.Id, rmqConnectionFactory);
+            }
+
+            public void RecoverConnection(IConnectionFactory rmqConnectionFactory)
+            {
+                if (this.RmqConnection == null || !this.RmqConnection.IsOpen)
+                {
+                    this.RmqConnection = CreateRmqConnection(this.Id, rmqConnectionFactory);
+                }
+            }
+
+            public void RenewLease()
+            {
+                this.LeaseIdentifier = Guid.NewGuid().ToString();
+            }
+
+            public bool IsOpen()
+            {
+                return this.RmqConnection != null && this.RmqConnection.IsOpen;
+            }
+
+            public void Close()
+            {
+                this.RmqConnection.Close();
+            }
+
+            public void Dispose()
+            {
+                this.RmqConnection.Close();
+                this.RmqConnection = null;
+            }
+
+            private IConnection CreateRmqConnection(string id, IConnectionFactory rmqConnectionFactory)
+            {
+                var newConnection = rmqConnectionFactory.CreateConnection();
+                newConnection.ConnectionShutdown += delegate { TryRemoveConnection(id, this.LeaseIdentifier, rmqConnectionFactory); };
+                return newConnection;
+            }
         }
     }
 }
